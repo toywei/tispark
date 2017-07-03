@@ -161,16 +161,8 @@ class TiStrategy(context: SQLContext) extends Strategy with Logging {
       filterPredicates.partition(TiUtils.isSupportedFilter)
 
     val residualFilter: Option[Expression] = residualFilters.reduceLeftOption(catalyst.expressions.And)
-    val residualFilterSet = AttributeSet(residualFilters.flatMap(_.references))
 
-    val tiFilters:Seq[TiExpr] = pushdownFilters.map(expr => expr match { case BasicExpression(expr) => expr })
-    val scanBuilder: ScanBuilder = new ScanBuilder
-    val pkIndex: TiIndexInfo = TiIndexInfo.generateFakePrimaryKeyIndex(source.table)
-    val scanPlan = scanBuilder.buildScan(JavaConversions.seqAsJavaList(tiFilters),
-      pkIndex, source.table)
-
-    selectRequest.addRanges(scanPlan.getKeyRanges)
-    scanPlan.getFilters.toList.map(selectRequest.addWhere)
+    filterToSelectRequest(pushdownFilters, source, selectRequest)
 
     // Right now we still use a projection even if the only evaluation is applying an alias
     // to a column.  Since this is a no-op, it could be avoided. However, using this
@@ -222,119 +214,116 @@ class TiStrategy(context: SQLContext) extends Strategy with Logging {
         NamedExpression.newExprId)
 
     // TODO: This test should be done once for all children
-    if (!isSupportedLogicalPlan(plan))
-      Nil
-    else
-      plan match {
-          // Collapse filters and projections and push plan directly
-        case PhysicalOperation(projectList, filters, LogicalRelation(source: TiDBRelation, _, _)) =>
-          pruneFilterProject(projectList, filters, source) :: Nil
+    plan match {
+      // Collapse filters and projections and push plan directly
+      case PhysicalOperation(projectList, filters, LogicalRelation(source: TiDBRelation, _, _)) =>
+        pruneFilterProject(projectList, filters, source) :: Nil
 
-          // Basic logic of original Spark's aggregation plan is:
-          // PhysicalAggregation extractor will rewrite original aggregation
-          // into aggregateExpressions and resultExpressions.
-          // resultExpressions contains only references [[AttributeReference]]
-          // to the result of aggregation. resultExpressions might contain projections
-          // like Add(sumResult, 1).
-          // For a aggregate like agg(expr) + 1, the rewrite process is: rewrite agg(expr) ->
-          // 1. pushdown: agg(expr) as agg1, if avg then sum(expr), count(expr)
-          // 2. residual expr (for Spark itself): agg(agg1) as finalAgg1 the parameter is a
-          // reference to pushed plan's corresponding aggregation
-          // 3. resultExpressions: finalAgg1 + 1, the finalAgg1 is the reference to final result
-          // of the aggregation
-        case PhysicalAggregation(
-                    groupingExpressions,
-                    aggregateExpressions,
-                    resultExpressions,
-                    TiAggregationProjection(filters, rel, source))
-          if !aggregateExpressions.exists(_.isDistinct) =>
-          var selReq: TiSelectRequest =
-            projectFilterToSelectRequest(Seq.empty[NamedExpression], filters, source)
-          val residualAggregateExpressions = aggregateExpressions.map {
-            aggExpr =>
-              aggExpr.aggregateFunction match {
-                  // here aggExpr is the original AggregationExpression
-                  // and will be pushed down to TiKV
-                case Max(_) => newAggregate(Max(toAlias(aggExpr).toAttribute), aggExpr)
-                case Min(_) => newAggregate(Min(toAlias(aggExpr).toAttribute), aggExpr)
-                case Count(_) => newAggregate(Sum(toAlias(aggExpr).toAttribute), aggExpr)
-                case Sum(_) => newAggregate(Sum(toAlias(aggExpr).toAttribute), aggExpr)
-                case First(_, ignoreNullsExpr) =>
-                  newAggregate(First(toAlias(aggExpr).toAttribute, ignoreNullsExpr), aggExpr)
-                case _ => aggExpr
-              }
-          } flatMap {
-            aggExpr =>
-              aggExpr match {
-                // We have to separate average into sum and count
-                // and for outside expression such as average(x) + 1,
-                // Spark has lift agg + 1 up to resultExpressions
-                // We need to modify the reference there as well to forge
-                // Divide(sum/count) + 1
-                case aggExpr@AggregateExpression(Average(ref), _, _, _) =>
-                  // Need a type promotion
-                  val promotedType = ref.dataType match {
-                    case DoubleType | DecimalType.Fixed(_, _) | LongType => ref
-                    case _ => Cast(ref, DoubleType)
-                  }
-                  val sumToPush = newAggregate(Sum(promotedType), aggExpr)
-                  val countToPush = newAggregate(Count(ref), aggExpr)
+      // Basic logic of original Spark's aggregation plan is:
+      // PhysicalAggregation extractor will rewrite original aggregation
+      // into aggregateExpressions and resultExpressions.
+      // resultExpressions contains only references [[AttributeReference]]
+      // to the result of aggregation. resultExpressions might contain projections
+      // like Add(sumResult, 1).
+      // For a aggregate like agg(expr) + 1, the rewrite process is: rewrite agg(expr) ->
+      // 1. pushdown: agg(expr) as agg1, if avg then sum(expr), count(expr)
+      // 2. residual expr (for Spark itself): agg(agg1) as finalAgg1 the parameter is a
+      // reference to pushed plan's corresponding aggregation
+      // 3. resultExpressions: finalAgg1 + 1, the finalAgg1 is the reference to final result
+      // of the aggregation
+      case PhysicalAggregation(
+      groupingExpressions,
+      aggregateExpressions,
+      resultExpressions,
+      TiAggregationProjection(filters, rel, source))
+        if !aggregateExpressions.exists(_.isDistinct) =>
+        var selReq: TiSelectRequest =
+          projectFilterToSelectRequest(Seq.empty[NamedExpression], filters, source)
+        val residualAggregateExpressions = aggregateExpressions.map {
+          aggExpr =>
+            aggExpr.aggregateFunction match {
+              // here aggExpr is the original AggregationExpression
+              // and will be pushed down to TiKV
+              case Max(_) => newAggregate(Max(toAlias(aggExpr).toAttribute), aggExpr)
+              case Min(_) => newAggregate(Min(toAlias(aggExpr).toAttribute), aggExpr)
+              case Count(_) => newAggregate(Sum(toAlias(aggExpr).toAttribute), aggExpr)
+              case Sum(_) => newAggregate(Sum(toAlias(aggExpr).toAttribute), aggExpr)
+              case First(_, ignoreNullsExpr) =>
+                newAggregate(First(toAlias(aggExpr).toAttribute, ignoreNullsExpr), aggExpr)
+              case _ => aggExpr
+            }
+        } flatMap {
+          aggExpr =>
+            aggExpr match {
+              // We have to separate average into sum and count
+              // and for outside expression such as average(x) + 1,
+              // Spark has lift agg + 1 up to resultExpressions
+              // We need to modify the reference there as well to forge
+              // Divide(sum/count) + 1
+              case aggExpr@AggregateExpression(Average(ref), _, _, _) =>
+                // Need a type promotion
+                val promotedType = ref.dataType match {
+                  case DoubleType | DecimalType.Fixed(_, _) | LongType => ref
+                  case _ => Cast(ref, DoubleType)
+                }
+                val sumToPush = newAggregate(Sum(promotedType), aggExpr)
+                val countToPush = newAggregate(Count(ref), aggExpr)
 
-                  // Need a new expression id since they are not simply rewrite as above
-                  val sumFinal = newAggregateWithId(Sum(toAlias(sumToPush).toAttribute), aggExpr)
-                  val countFinal = newAggregateWithId(Sum(toAlias(countToPush).toAttribute), aggExpr)
+                // Need a new expression id since they are not simply rewrite as above
+                val sumFinal = newAggregateWithId(Sum(toAlias(sumToPush).toAttribute), aggExpr)
+                val countFinal = newAggregateWithId(Sum(toAlias(countToPush).toAttribute), aggExpr)
 
-                  avgPushdownRewriteMap(aggExpr.resultId) = List(sumToPush, countToPush)
-                  avgFinalRewriteMap(aggExpr.resultId) = List(sumFinal, countFinal)
-                  List(sumFinal, countFinal)
-                case _ => aggExpr :: Nil
-              }
-          }
+                avgPushdownRewriteMap(aggExpr.resultId) = List(sumToPush, countToPush)
+                avgFinalRewriteMap(aggExpr.resultId) = List(sumFinal, countFinal)
+                List(sumFinal, countFinal)
+              case _ => aggExpr :: Nil
+            }
+        }
 
-          val pushdownAggregates = aggregateExpressions.flatMap {
-            aggExpr =>
-              avgPushdownRewriteMap
-                .getOrElse(aggExpr.resultId, List(aggExpr))
-          }
+        val pushdownAggregates = aggregateExpressions.flatMap {
+          aggExpr =>
+            avgPushdownRewriteMap
+              .getOrElse(aggExpr.resultId, List(aggExpr))
+        }
 
-          selReq = aggregationToSelectRequest(groupingExpressions,
-                                              pushdownAggregates,
-                                              source,
-                                              selReq)
+        selReq = aggregationToSelectRequest(groupingExpressions,
+          pushdownAggregates,
+          source,
+          selReq)
 
-          val rewrittenResultExpression = resultExpressions.map(
-            expr => expr.transformDown {
-              case aggExpr: AttributeReference
-                if avgFinalRewriteMap.contains(aggExpr.exprId) =>
-                // Replace the original Average expression with Div of Alias
-                val sumCountPair = avgFinalRewriteMap(aggExpr.exprId)
+        val rewrittenResultExpression = resultExpressions.map(
+          expr => expr.transformDown {
+            case aggExpr: AttributeReference
+              if avgFinalRewriteMap.contains(aggExpr.exprId) =>
+              // Replace the original Average expression with Div of Alias
+              val sumCountPair = avgFinalRewriteMap(aggExpr.exprId)
 
-                // We missed the chance for auto-coerce already
-                // so manual cast needed
-                // Also, convert into resultAttribute since
-                // they are created by tiSpark without Spark conversion
-                // TODO: Is DoubleType a best target type for all?
-                Cast(
-                  Divide(
-                    Cast(sumCountPair.head.resultAttribute, DoubleType),
-                    Cast(sumCountPair(1).resultAttribute, DoubleType)
-                  ),
-                  aggExpr.dataType
-                )
-              case other => other
-            }.asInstanceOf[NamedExpression]
-          )
+              // We missed the chance for auto-coerce already
+              // so manual cast needed
+              // Also, convert into resultAttribute since
+              // they are created by tiSpark without Spark conversion
+              // TODO: Is DoubleType a best target type for all?
+              Cast(
+                Divide(
+                  Cast(sumCountPair.head.resultAttribute, DoubleType),
+                  Cast(sumCountPair(1).resultAttribute, DoubleType)
+                ),
+                aggExpr.dataType
+              )
+            case other => other
+          }.asInstanceOf[NamedExpression]
+        )
 
-          val output = (groupingExpressions ++ pushdownAggregates.map(x => toAlias(x))).map(_.toAttribute)
+        val output = (groupingExpressions ++ pushdownAggregates.map(x => toAlias(x))).map(_.toAttribute)
 
-          aggregate.AggUtils.planAggregateWithoutDistinct(
-            groupingExpressions,
-            residualAggregateExpressions,
-            rewrittenResultExpression,
-            toCoprocessorRDD(source, output, filterToSelectRequest(filters, source, selReq)))
+        aggregate.AggUtils.planAggregateWithoutDistinct(
+          groupingExpressions,
+          residualAggregateExpressions,
+          rewrittenResultExpression,
+          toCoprocessorRDD(source, output, filterToSelectRequest(filters, source, selReq)))
 
-        case _ => Nil
-      }
+      case _ => Nil
+    }
   }
 }
 

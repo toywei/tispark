@@ -16,15 +16,13 @@
 package com.pingcap.tispark
 
 
+import com.pingcap.tikv.{TiCluster, TiConfiguration}
 import com.pingcap.tikv.types._
 import org.apache.spark.sql
+import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.expressions.{Expression, IntegerLiteral, NamedExpression}
-import org.apache.spark.sql.catalyst.planning.{PhysicalAggregation, PhysicalOperation}
-import org.apache.spark.sql.catalyst.plans.logical
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.types.DataType
+import scala.collection.JavaConversions._
 
 
 object TiUtils {
@@ -35,55 +33,6 @@ object TiUtils {
   type TiFirst = com.pingcap.tikv.expression.aggregate.First
   type TiDataType = com.pingcap.tikv.types.DataType
   type TiTypes = com.pingcap.tikv.types.Types
-
-
-  def isSupportedLogicalPlan(plan: LogicalPlan): Boolean = {
-    plan match {
-      case PhysicalAggregation(
-      groupingExpressions, aggregateExpressions, _, child) =>
-        !aggregateExpressions.exists(expr => !isSupportedAggregate(expr)) &&
-          !groupingExpressions.exists(expr => !isSupportedGroupingExpr(expr)) &&
-          isSupportedLogicalPlan(child)
-
-      case PhysicalOperation(projectList, filters, child) if child ne plan =>
-        isSupportedPhysicalOperation(plan, projectList, filters, child)
-
-      case logical.ReturnAnswer(rootPlan) => rootPlan match {
-        case logical.Limit(IntegerLiteral(_), logical.Sort(_, true, child)) =>
-          isSupportedPlanWithDistinct(child)
-        case logical.Limit(IntegerLiteral(_),
-        logical.Project(_, logical.Sort(_, true, child))) =>
-          isSupportedPlanWithDistinct(child)
-        case logical.Limit(IntegerLiteral(_), child) =>
-          isSupportedPlanWithDistinct(child)
-        case _ => false
-      }
-
-      case LogicalRelation(_: TiDBRelation, _, _) => true
-
-      case _ => false
-    }
-  }
-
-  def isSupportedPhysicalOperation(currentPlan: LogicalPlan,
-                                           projectList: Seq[NamedExpression],
-                                           filterList: Seq[Expression],
-                                           child: LogicalPlan): Boolean = {
-    // It seems Spark return the plan itself if no match instead of fail
-    // So do a test avoiding unlimited recursion
-    !projectList.exists(expr => !isSupportedProjection(expr)) &&
-      !filterList.exists(expr => !isSupportedFilter(expr)) &&
-      isSupportedLogicalPlan(child)
-  }
-
-  def isSupportedPlanWithDistinct(plan: LogicalPlan): Boolean = {
-    plan match {
-      case PhysicalOperation(projectList, filters, child) if child ne plan =>
-        isSupportedPhysicalOperation(plan, projectList, filters, child)
-      case _: TiDBRelation => true
-      case _ => false
-    }
-  }
 
   def isSupportedAggregate(aggExpr: AggregateExpression): Boolean = {
     aggExpr.aggregateFunction match {
@@ -131,5 +80,10 @@ object TiUtils {
       case _: sql.types.DoubleType => DataTypeFactory.of(Types.TYPE_NEW_DECIMAL)
       case _: sql.types.TimestampType => DataTypeFactory.of(Types.TYPE_DATE)
     }
+  }
+
+  def createCluster(addresses: List[String]): TiCluster = {
+    val conf: TiConfiguration = TiConfiguration.createDefault(addresses)
+    val cluster: TiCluster = TiCluster.getCluster(conf)
   }
 }
