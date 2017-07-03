@@ -172,7 +172,9 @@ class TiStrategy(context: SQLContext) extends Strategy with Logging {
       val scan = toCoprocessorRDD(source, projectSeq, selectRequest)
       residualFilter.map(FilterExec(_, scan)).getOrElse(scan)
     } else {
-      val projectSeq: Seq[Attribute] = (projectSet ++ residualFilterSet).toSeq
+      // for now all column used will be returned for old interface
+      // TODO: once switch to new interface we change this pruning logic
+      val projectSeq: Seq[Attribute] = (projectSet ++ filterSet).toSeq
       projectSeq.foreach(attr => selectRequest.addField(TiColumnRef.create(attr.name)))
       val scan = toCoprocessorRDD(source, projectSeq, selectRequest)
       ProjectExec(projectList, residualFilter.map(FilterExec(_, scan)).getOrElse(scan))
